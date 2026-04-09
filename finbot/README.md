@@ -162,8 +162,8 @@ Date,Description,Amount
 
 **Om Naik**
 - 📧 Email: [omnaik6969@gmail.com](mailto:omnaik6969@gmail.com)
-- 🐙 GitHub: [@omnaik](https://github.com/omnaik)
-- 💼 LinkedIn: [linkedin.com/in/omnaik](https://linkedin.com/in/omnaik)
+- 🐙 GitHub: [@omnaik](https://github.com/Chrisbrown1306/FinBot)
+
 
 ---
 
