@@ -1,294 +1,336 @@
-from fastapi import FastAPI, UploadFile, File
+import os
+import json
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os, json, re
-from datetime import datetime
-from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import tool
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
 import pdfplumber
+import csv
+from io import StringIO
+from dotenv import load_dotenv
+import openai
+from fastapi import Form
+# Load environment variables
+load_dotenv()
 
-app = FastAPI(title="FinBot – Personal Finance AI Agent")
+# Set OpenAI API key
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
+if not openai.api_key:
+    raise ValueError("OPENAI_API_KEY not set in .env file")
+
+# Initialize FastAPI
+app = FastAPI()
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-key-here")
-
-# ── In-memory store ──────────────────────────────────────────────────────────
-transactions: list[dict] = []
-chat_histories: dict[str, ChatMessageHistory] = {}
-
-
-# ── Tools ────────────────────────────────────────────────────────────────────
-
-@tool
-def get_spending_summary(category: str = "all") -> str:
-    """Get spending summary. Pass category name or 'all' for everything."""
-    if not transactions:
-        return "No transactions loaded yet. Please upload a bank statement first."
-    filtered = (
-        transactions
-        if category == "all"
-        else [t for t in transactions if t.get("category", "").lower() == category.lower()]
-    )
-    total = sum(t["amount"] for t in filtered if t["amount"] < 0)
-    income = sum(t["amount"] for t in filtered if t["amount"] > 0)
-    by_cat: dict[str, float] = {}
-    for t in transactions:
-        if t["amount"] < 0:
-            cat = t.get("category", "Other")
-            by_cat[cat] = by_cat.get(cat, 0) + abs(t["amount"])
-    sorted_cats = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)
-    result = f"Total spent: ₹{abs(total):.2f} | Income: ₹{income:.2f}\nTop categories:\n"
-    for cat, amt in sorted_cats[:5]:
-        result += f"  • {cat}: ₹{amt:.2f}\n"
-    return result
-
-
-@tool
-def get_savings_advice(monthly_income: float = 0) -> str:
-    """Get personalized savings advice based on spending patterns."""
-    if not transactions:
-        return "Upload transactions first."
-    total_spent = sum(abs(t["amount"]) for t in transactions if t["amount"] < 0)
-    income = monthly_income or sum(t["amount"] for t in transactions if t["amount"] > 0)
-    savings_rate = ((income - total_spent) / income * 100) if income > 0 else 0
-    by_cat: dict[str, float] = {}
-    for t in transactions:
-        if t["amount"] < 0:
-            cat = t.get("category", "Other")
-            by_cat[cat] = by_cat.get(cat, 0) + abs(t["amount"])
-    top_expense = max(by_cat, key=by_cat.get) if by_cat else "Unknown"
-    advice = f"Savings rate: {savings_rate:.1f}%\n"
-    if savings_rate < 20:
-        advice += (
-            f"⚠️ You should save at least 20% of income. "
-            f"Your top expense is {top_expense} (₹{by_cat.get(top_expense, 0):.0f}). "
-            f"Consider reducing it by 15–20%.\n"
-        )
-    else:
-        advice += "✅ Great savings rate! Consider investing surplus in index funds.\n"
-    advice += "Tip: Apply the 50/30/20 rule — 50% needs, 30% wants, 20% savings."
-    return advice
-
-
-@tool
-def find_unusual_transactions(threshold: float = 5000) -> str:
-    """Find unusually large transactions above a threshold amount."""
-    if not transactions:
-        return "No transactions loaded."
-    large = [t for t in transactions if abs(t["amount"]) > threshold]
-    if not large:
-        return f"No transactions above ₹{threshold}."
-    result = f"Found {len(large)} large transactions:\n"
-    for t in sorted(large, key=lambda x: abs(x["amount"]), reverse=True)[:10]:
-        result += f"  • {t.get('date','?')} | {t.get('description','?')} | ₹{abs(t['amount']):.2f}\n"
-    return result
-
-
-@tool
-def get_monthly_trend() -> str:
-    """Get month-by-month spending trend."""
-    if not transactions:
-        return "No transactions loaded."
-    monthly: dict[str, float] = {}
-    for t in transactions:
-        if t["amount"] < 0:
-            try:
-                month = t.get("date", "")[:7]
-                monthly[month] = monthly.get(month, 0) + abs(t["amount"])
-            except Exception:
-                pass
-    if not monthly:
-        return "Could not parse monthly data."
-    result = "Monthly spending trend:\n"
-    for month in sorted(monthly.keys()):
-        bar = "█" * int(monthly[month] / 1000)
-        result += f"  {month}: ₹{monthly[month]:.0f} {bar}\n"
-    return result
-
-
-# ── LangChain Agent ──────────────────────────────────────────────────────────
-
-tools = [get_spending_summary, get_savings_advice, find_unusual_transactions, get_monthly_trend]
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are FinBot, a friendly and smart personal finance AI assistant.
-You help users understand their bank statements, track spending, and suggest savings strategies.
-Be concise, use ₹ for Indian Rupees, and always be encouraging.
-When you don't have data, ask the user to upload their bank statement.
-Format responses with bullet points and emojis where helpful."""),
-    MessagesPlaceholder(variable_name="chat_history"),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
-
-llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.3, api_key=OPENAI_API_KEY)
-agent = create_openai_tools_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-
-def get_session_history(session_id: str) -> ChatMessageHistory:
-    if session_id not in chat_histories:
-        chat_histories[session_id] = ChatMessageHistory()
-    return chat_histories[session_id]
-
-
-agent_with_history = RunnableWithMessageHistory(
-    agent_executor,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="chat_history",
-)
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def categorize(description: str) -> str:
-    desc = description.lower()
-    if any(w in desc for w in ["swiggy", "zomato", "restaurant", "cafe", "food", "pizza", "blinkit", "dunzo"]):
-        return "Food & Dining"
-    if any(w in desc for w in ["amazon", "flipkart", "shopping", "myntra", "meesho", "nykaa"]):
-        return "Shopping"
-    if any(w in desc for w in ["uber", "ola", "metro", "petrol", "fuel", "rapido", "irctc"]):
-        return "Transport"
-    if any(w in desc for w in ["netflix", "spotify", "prime", "hotstar", "youtube", "zee5"]):
-        return "Entertainment"
-    if any(w in desc for w in ["electricity", "water", "broadband", "recharge", "bill", "jio", "airtel"]):
-        return "Utilities"
-    if any(w in desc for w in ["salary", "credit", "neft", "transfer received", "imps received"]):
-        return "Income"
-    if any(w in desc for w in ["hospital", "pharmacy", "doctor", "medplus", "apollo"]):
-        return "Healthcare"
-    return "Other"
-
-
-# ── Routes ───────────────────────────────────────────────────────────────────
+# Store transactions in memory per session
+sessions = {}
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
 
+class UploadResponse(BaseModel):
+    message: str
+    transaction_count: int
 
-@app.get("/")
-def root():
-    return {"status": "FinBot API running", "author": "Om Naik", "email": "omnaik6969@gmail.com"}
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
 
-
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
+# Helper function to parse CSV
+def parse_csv(content: str):
     try:
-        result = agent_with_history.invoke(
-            {"input": req.message},
-            config={"configurable": {"session_id": req.session_id}},
-        )
-        return {"response": result["output"]}
-    except Exception as e:
-        return {"response": f"I encountered an error: {str(e)}. Please check your OpenAI API key."}
+        reader = csv.DictReader(StringIO(content))
+        transactions = []
 
-
-@app.post("/api/upload")
-async def upload_statement(file: UploadFile = File(...)):
-    global transactions
-    transactions = []
-    content = await file.read()
-
-    if file.filename.endswith(".pdf"):
-        import io
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        lines = text.split("\n")
-        for line in lines:
-            amounts = re.findall(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d{2})", line)
-            if amounts:
-                amt_str = amounts[-1].replace(",", "")
-                try:
-                    amount = float(amt_str)
-                    date_match = re.search(r"\d{2}[/-]\d{2}[/-]\d{2,4}", line)
-                    transactions.append({
-                        "date": date_match.group() if date_match else "Unknown",
-                        "description": line[:60].strip(),
-                        "amount": -abs(amount) if "dr" in line.lower() else amount,
-                        "category": categorize(line),
-                    })
-                except Exception:
-                    pass
-
-    elif file.filename.endswith(".csv"):
-        import csv, io
-        reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
         for row in reader:
-            desc = row.get("Description", row.get("Narration", ""))
-            amt_str = row.get("Amount", row.get("Debit", "0")).replace(",", "")
+            # Normalize keys (lowercase)
+            row = {k.lower(): v for k, v in row.items()}
+
+            transactions.append({
+                "date": row.get("date") or row.get("transaction date", ""),
+                "description": row.get("description") or row.get("details", ""),
+                "amount": float(row.get("amount") or row.get("debit") or 0)
+            })
+
+        return transactions
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV parsing error: {str(e)}")
+# Helper function to parse PDF
+def parse_pdf(file_content: bytes):
+    try:
+        transactions = []
+        with pdfplumber.open(file_content) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                # Try to extract simple transaction format
+                lines = text.split('\n')
+                for line in lines:
+                    if ',' in line:
+                        parts = line.split(',')
+                        if len(parts) >= 3:
+                            try:
+                                transactions.append({
+                                    "date": parts[0].strip(),
+                                    "description": parts[1].strip(),
+                                    "amount": float(parts[2].strip())
+                                })
+                            except:
+                                pass
+        return transactions if transactions else []
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF parsing error: {str(e)}")
+
+# Helper function to analyze spending
+def get_spending_summary(transactions):
+    categories = {}
+    for txn in transactions:
+        desc = txn["description"].lower()
+        
+        # Simple category detection
+        if any(word in desc for word in ["food", "swiggy", "zomato", "restaurant"]):
+            category = "Food"
+        elif any(word in desc for word in ["amazon", "flipkart", "shopping"]):
+            category = "Shopping"
+        elif any(word in desc for word in ["uber", "ola", "taxi", "gas", "fuel"]):
+            category = "Transport"
+        elif any(word in desc for word in ["electricity", "water", "bill"]):
+            category = "Utilities"
+        elif any(word in desc for word in ["netflix", "spotify", "gym"]):
+            category = "Entertainment"
+        else:
+            category = "Other"
+        
+        if category not in categories:
+            categories[category] = 0
+        categories[category] += abs(txn["amount"])
+    
+    return categories
+
+# Helper function to find unusual transactions
+def find_unusual_transactions(transactions, threshold=5000):
+    unusual = []
+    for txn in transactions:
+        if abs(txn["amount"]) > threshold:
+            unusual.append(txn)
+    return unusual
+
+# Helper function to get monthly trend
+def get_monthly_trend(transactions):
+    monthly = {}
+    for txn in transactions:
+        month = txn["date"][:7]  # YYYY-MM
+        if month not in monthly:
+            monthly[month] = 0
+        monthly[month] += abs(txn["amount"])
+    return monthly
+
+def get_ai_response(question, transactions):
+    try:
+        spending = get_spending_summary(transactions)
+        total_spent = sum(spending.values())
+        total_income = sum(t["amount"] for t in transactions if t["amount"] > 0)
+        
+        # If no transactions, return simple response
+        if not transactions or total_spent == 0:
+            return "No spending data available. Please upload a file first."
+        
+        # Analyze the question and respond accordingly
+        question_lower = question.lower()
+        
+        # Question: "What did I spend the most on?"
+        if any(word in question_lower for word in ["spent most", "highest spending", "biggest expense"]):
+            top_category = max(spending.items(), key=lambda x: x[1])[0] if spending else "Unknown"
+            top_amount = spending.get(top_category, 0)
+            return f"You spent the most on **{top_category}** at **₹{top_amount:,.0f}**.\n\nYour spending breakdown:\n" + "\n".join([f"• {cat}: ₹{amt:,.0f}" for cat, amt in sorted(spending.items(), key=lambda x: x[1], reverse=True)])
+        
+        # Question: "How can I save more?"
+        elif any(word in question_lower for word in ["save", "savings", "reduce spending", "budget"]):
+            total = sum(spending.values())
+            top_cat = max(spending.items(), key=lambda x: x[1])[0] if spending else "Unknown"
+            top_amt = spending.get(top_cat, 0)
+            savings_pct = ((total_income - total_spent) / total_income * 100) if total_income > 0 else 0
+            return f"Here's how you can save more:\n\n💡 **Current Savings Rate: {savings_pct:.1f}%**\n\n• Your biggest expense is **{top_cat}** (₹{top_amt:,.0f}). Try reducing this by 10-20%.\n• Track your spending daily to identify wasteful expenses.\n• Set a monthly budget and stick to it (try the 50/30/20 rule).\n• Use cashback and rewards programs."
+        
+        # Question: "Show my monthly trend"
+        elif any(word in question_lower for word in ["monthly", "trend", "month", "over time"]):
+            monthly = get_monthly_trend(transactions)
+            trend_text = "\n".join([f"• {month}: ₹{amt:,.0f}" for month, amt in sorted(monthly.items())])
+            return f"📅 **Your Monthly Spending Trend:**\n\n{trend_text}"
+        
+        # Question: "Find transactions above X"
+        elif any(word in question_lower for word in ["above", "exceed", "more than", "large"]):
+            threshold = 5000
+            unusual = find_unusual_transactions(transactions, threshold)
+            if unusual:
+                unusual_text = "\n".join([f"• {t['date']}: {t['description']} - ₹{abs(t['amount']):,.0f}" for t in unusual])
+                return f"🚨 **Large Transactions Above ₹{threshold:,}:**\n\n{unusual_text}"
+            else:
+                return f"No transactions above ₹{threshold:,} found."
+        
+        # Question: "What's my savings rate?"
+        elif any(word in question_lower for word in ["savings rate", "save", "saving percentage"]):
+            savings_rate = ((total_income - total_spent) / total_income * 100) if total_income > 0 else 0
+            savings_amt = total_income - total_spent
+            return f"💰 **Your Savings Metrics:**\n\n• **Savings Rate:** {savings_rate:.1f}%\n• **Total Income:** ₹{total_income:,.0f}\n• **Total Spent:** ₹{total_spent:,.0f}\n• **Amount Saved:** ₹{savings_amt:,.0f}\n\n✅ Good job tracking your finances!"
+        
+        # Question: "Give me a budget breakdown"
+        elif any(word in question_lower for word in ["budget", "breakdown", "categories"]):
+            breakdown = "\n".join([f"• {cat}: ₹{amt:,.0f} ({amt/total_spent*100:.1f}%)" for cat, amt in sorted(spending.items(), key=lambda x: x[1], reverse=True)])
+            return f"📊 **Budget Breakdown:**\n\n{breakdown}"
+        
+        # Default: try OpenAI or return summary
+        else:
             try:
-                amount = float(amt_str)
-                transactions.append({
-                    "date": row.get("Date", ""),
-                    "description": desc,
-                    "amount": amount,
-                    "category": categorize(desc),
-                })
-            except Exception:
-                pass
+                prompt = f"""User asked: {question}
 
-    else:
-        # Demo data
-        transactions = [
-            {"date": "2024-01", "description": "Swiggy order", "amount": -450, "category": "Food & Dining"},
-            {"date": "2024-01", "description": "Salary credit", "amount": 55000, "category": "Income"},
-            {"date": "2024-01", "description": "Amazon purchase", "amount": -2300, "category": "Shopping"},
-            {"date": "2024-01", "description": "Netflix subscription", "amount": -649, "category": "Entertainment"},
-            {"date": "2024-01", "description": "Electricity bill", "amount": -1200, "category": "Utilities"},
-            {"date": "2024-01", "description": "Uber ride", "amount": -180, "category": "Transport"},
-            {"date": "2024-01", "description": "Zomato order", "amount": -380, "category": "Food & Dining"},
-            {"date": "2024-02", "description": "Salary credit", "amount": 55000, "category": "Income"},
-            {"date": "2024-02", "description": "Flipkart purchase", "amount": -3200, "category": "Shopping"},
-            {"date": "2024-02", "description": "Jio recharge", "amount": -299, "category": "Utilities"},
-            {"date": "2024-02", "description": "Rapido ride", "amount": -120, "category": "Transport"},
-            {"date": "2024-02", "description": "Hotstar subscription", "amount": -499, "category": "Entertainment"},
-            {"date": "2024-02", "description": "Zomato order", "amount": -650, "category": "Food & Dining"},
-            {"date": "2024-03", "description": "Salary credit", "amount": 55000, "category": "Income"},
-            {"date": "2024-03", "description": "Hospital bill", "amount": -2500, "category": "Healthcare"},
-            {"date": "2024-03", "description": "Amazon purchase", "amount": -1800, "category": "Shopping"},
-            {"date": "2024-03", "description": "Swiggy order", "amount": -520, "category": "Food & Dining"},
-            {"date": "2024-03", "description": "Electricity bill", "amount": -1350, "category": "Utilities"},
-        ]
+Financial Data:
+- Total spent: ₹{total_spent}
+- Total income: ₹{total_income}
+- Spending by category: {json.dumps(spending, indent=2)}
+- Transactions: {len(transactions)}
 
-    return {"message": f"Loaded {len(transactions)} transactions", "count": len(transactions)}
+Give a helpful 2-3 sentence financial response."""
+                
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful financial advisor."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=150
+                )
+                
+                return response['choices'][0]['message']['content']
+            except Exception as ai_error:
+                print(f"⚠️ OpenAI Error: {str(ai_error)}")
+                # Generic response if OpenAI fails
+                return f"Based on your transactions:\n- Total spent: ₹{total_spent:,.0f}\n- Total income: ₹{total_income:,.0f}\n- Transactions: {len(transactions)}\n\nAsk me: 'What did I spend the most on?' or 'How can I save more?'"
+            
+    except Exception as e:
+        print(f"❌ Error in get_ai_response: {str(e)}")
+        return f"Error analyzing spending: {str(e)}"
+# Routes
+@app.get("/")
+def read_root():
+    return {"message": "FinBot API running"}
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), session_id: str = Form(default="default")):
+   
+    if not session_id or session_id == "default":
+        session_id = "default"
+    try:
+        print("📂 File:", file.filename)
 
-@app.get("/api/transactions")
-def get_transactions():
-    return {"transactions": transactions[:50], "total": len(transactions)}
+        content = await file.read()
 
+        if file.filename.endswith(".csv"):
+            content_str = content.decode('utf-8')
+            print("📄 CSV Preview:", content_str[:100])
+            transactions = parse_csv(content_str)
 
-@app.get("/api/stats")
-def get_stats():
-    if not transactions:
-        return {"total_spent": 0, "total_income": 0, "transaction_count": 0, "categories": {}}
-    total_spent = sum(abs(t["amount"]) for t in transactions if t["amount"] < 0)
-    total_income = sum(t["amount"] for t in transactions if t["amount"] > 0)
-    by_cat: dict[str, float] = {}
-    for t in transactions:
-        if t["amount"] < 0:
-            cat = t.get("category", "Other")
-            by_cat[cat] = by_cat.get(cat, 0) + abs(t["amount"])
+        elif file.filename.endswith(".pdf"):
+            transactions = parse_pdf(content)
+
+        else:
+            raise HTTPException(status_code=400, detail="Only CSV and PDF files supported")
+
+        print("✅ Transactions parsed:", len(transactions))
+
+        if session_id not in sessions:
+            sessions[session_id] = []
+
+        sessions[session_id] = transactions
+
+        return UploadResponse(
+            message=f"Successfully uploaded {len(transactions)} transactions",
+            transaction_count=len(transactions)
+        )
+
+    except Exception as e:
+        print("❌ ERROR:", str(e))   # 👈 THIS IS KEY
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    try:
+        session_id = request.session_id
+        
+        if session_id not in sessions or not sessions[session_id]:
+            return {"error": "No transactions uploaded. Please upload a file first."}
+        
+        transactions = sessions[session_id]
+        response = get_ai_response(request.message, transactions)
+        
+        return {
+            "response": response,
+            "session_id": session_id,
+            "success": True
+        }
+    except Exception as e:
+        print(f"❌ Chat Error: {str(e)}")
+        return {
+            "error": str(e),
+            "success": False
+        }
+@app.get("/transactions")
+def get_transactions(session_id: str = "default"):
+    if session_id not in sessions:
+        return {"transactions": []}
+    
+    return {"transactions": sessions[session_id]}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+# Sample demo data
+DEMO_DATA = [
+    {"date": "2024-01-01", "description": "Salary Deposit", "amount": 55000},
+    {"date": "2024-01-02", "description": "Amazon Purchase", "amount": -2300},
+    {"date": "2024-01-03", "description": "Swiggy Food Order", "amount": -450},
+    {"date": "2024-01-05", "description": "Mobile Recharge", "amount": -500},
+    {"date": "2024-01-07", "description": "Netflix Subscription", "amount": -199},
+    {"date": "2024-01-10", "description": "Electricity Bill", "amount": -1200},
+    {"date": "2024-01-12", "description": "Starbucks Coffee", "amount": -250},
+    {"date": "2024-01-15", "description": "Zomato Food", "amount": -680},
+    {"date": "2024-01-18", "description": "Uber Rides", "amount": -900},
+    {"date": "2024-01-20", "description": "Flipkart Electronics", "amount": -5000},
+    {"date": "2024-01-22", "description": "Gym Membership", "amount": -1500},
+    {"date": "2024-01-25", "description": "Restaurant Dinner", "amount": -2500},
+    {"date": "2024-02-01", "description": "Salary Deposit", "amount": 55000},
+    {"date": "2024-02-03", "description": "Amazon Purchase", "amount": -1500},
+    {"date": "2024-02-05", "description": "Swiggy Food Order", "amount": -320},
+    {"date": "2024-02-10", "description": "Insurance", "amount": -2000},
+    {"date": "2024-02-15", "description": "Gas Station", "amount": -800},
+    {"date": "2024-02-20", "description": "Groceries", "amount": -1200},
+    {"date": "2024-03-01", "description": "Salary Deposit", "amount": 55000},
+    {"date": "2024-03-05", "description": "Swiggy Food Order", "amount": -450},
+]
+
+@app.post("/load-demo")
+def load_demo(session_id: str = "default"):
+    """Load demo data for testing"""
+    if session_id not in sessions:
+        sessions[session_id] = []
+    
+    sessions[session_id] = DEMO_DATA
+    
     return {
-        "total_spent": round(total_spent, 2),
-        "total_income": round(total_income, 2),
-        "transaction_count": len(transactions),
-        "categories": by_cat,
+        "success": True,
+        "message": f"Loaded {len(DEMO_DATA)} demo transactions",
+        "transaction_count": len(DEMO_DATA)
     }
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
