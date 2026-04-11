@@ -210,15 +210,15 @@ export default function App() {
   const fetchStats = useCallback(async () => {
     try {
       const [s, t] = await Promise.all([
-        fetch(`${API}/api/stats`).then(r => r.json()),
-        fetch(`${API}/api/transactions`).then(r => r.json()),
+       
+        fetch(`${API}/transactions`).then(r => r.json()),
       ]);
-      setStats(s);
+      
       setTransactions(t.transactions || []);
     } catch { /* silent */ }
   }, []);
 
-  const send = async (text) => {
+const send = async (text) => {
     const msg = text || input.trim();
     if (!msg) return;
     setInput("");
@@ -226,35 +226,45 @@ export default function App() {
     setMessages(prev => [...prev, { role: "user", content: msg, time }, { role: "assistant", content: "", loading: true, time }]);
     setLoading(true);
     try {
-      const res = await fetch(`${API}/api/chat`, {
+      console.log("🔵 Sending:", msg);
+      const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: msg, session_id: sessionId }),
       });
+      
+      console.log("🟢 Response status:", res.status);
       const data = await res.json();
-      setMessages(prev => [...prev.slice(0, -1), { role: "assistant", content: data.response, time }]);
+      console.log("🟡 Response data:", data);
+      
+      // Handle response - check for both response and error fields
+      const responseText = data.response || data.error || "No response received";
+      
+      setMessages(prev => [...prev.slice(0, -1), { role: "assistant", content: responseText, time }]);
       fetchStats();
-    } catch {
+    } catch (error) {
+      console.error("🔴 Error:", error);
       setMessages(prev => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ Could not reach the server. Make sure the backend is running at " + API, time }]);
     }
     setLoading(false);
   };
-
   const upload = async (file) => {
     if (!file) return;
     setUploading(true);
     const form = new FormData();
     form.append("file", file);
+   
+    form.append("session_id", sessionId);
     const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     setMessages(prev => [...prev, {
       role: "user", content: `📎 Uploaded: ${file.name}`, time,
     }, { role: "assistant", content: "", loading: true, time }]);
     try {
-      const res = await fetch(`${API}/api/upload`, { method: "POST", body: form });
+      const res = await fetch(`${API}/upload`, { method: "POST", body: form });
       const data = await res.json();
       setMessages(prev => [...prev.slice(0, -1), {
         role: "assistant",
-        content: `✅ Loaded **${data.count}** transactions from **${file.name}**!\n\nYou can now ask me anything about your spending. Try:\n• "What did I spend the most on?"\n• "Show my monthly trend"\n• "How can I save more?"`,
+        content: `✅ Loaded **${data.transaction_count}** transactions from **${file.name}**!\n\nYou can now ask me anything about your spending. Try:\n• "What did I spend the most on?"\n• "Show my monthly trend"\n• "How can I save more?"`,
         time,
       }]);
       fetchStats();
